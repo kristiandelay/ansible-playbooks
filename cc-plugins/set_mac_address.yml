@@ -1,0 +1,133 @@
+---
+- name: Set MAC address for network interface
+  hosts: all
+  become: yes  # Equivalent to sudo
+  vars:
+    log_file: "/usr/local/code/chaos-control-plane/control-plane-out.log"
+    mac_address: "{{ mac_address_input | default('fa:5a:ea:d3:59:44') }}"  # Pass MAC address as variable
+    log_dir: "{{ log_file | dirname }}"
+
+  tasks:
+    - name: Ensure log directory exists
+      ansible.builtin.file:
+        path: "{{ log_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+      register: log_dir_result
+
+    - name: Log creation of log directory
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Created log directory: {{ log_dir }}" >> "{{ log_file }}"
+      when: log_dir_result.changed
+
+    - name: Check if nmcli is installed
+      ansible.builtin.command: which nmcli
+      register: nmcli_check
+      failed_when: nmcli_check.rc != 0
+      changed_when: false
+
+    - name: Fail if nmcli is not installed
+      ansible.builtin.fail:
+        msg: "Error: NetworkManager (nmcli) is not installed or not in PATH"
+      when: nmcli_check.rc != 0
+
+    - name: Validate MAC address format
+      ansible.builtin.assert:
+        that:
+          - mac_address | regex_search('^([a-fA-F0-9]{2}:){5}[a-fA-F0-9]{2}$')
+        fail_msg: "Error: Invalid MAC address format: {{ mac_address }}"
+        quiet: true
+
+    - name: Find wireless device (wlx)
+      ansible.builtin.shell: nmcli device | grep -o '^wlx[[:alnum:]]*' || true
+      register: wireless_device
+      changed_when: false
+
+    - name: Find wired device (enx) if no wireless device found
+      ansible.builtin.shell: nmcli device | grep -o '^enx[[:alnum:]]*' || true
+      register: wired_device
+      when: wireless_device.stdout == ""
+
+    - name: Set device name and type
+      ansible.builtin.set_fact:
+        device_name: "{{ wireless_device.stdout if wireless_device.stdout != '' else wired_device.stdout }}"
+        device_type: "{{ 'wireless' if wireless_device.stdout != '' else 'wired' }}"
+
+    - name: Fail if no device is found
+      ansible.builtin.fail:
+        msg: "Error: No network device found (neither wlx nor enx)"
+      when: device_name == ""
+
+    - name: Log found device
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Found {{ device_type }} device: {{ device_name }}" >> "{{ log_file }}"
+
+    - name: Log attempt to set MAC address
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Attempting to set MAC address to: {{ mac_address }}" >> "{{ log_file }}"
+
+    - name: Get current MAC address
+      ansible.builtin.shell: nmcli device show "{{ device_name }}" | grep -i 'GENERAL.HWADDR' | awk '{print $2}' | tr '[:upper:]' '[:lower:]'
+      register: current_mac
+      changed_when: false
+
+    - name: Log current MAC address
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Current MAC address: {{ current_mac.stdout }}" >> "{{ log_file }}"
+
+    - name: Check if MAC address already matches
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] MAC address is already set to {{ mac_address }} for {{ device_type }} device {{ device_name }}. No changes needed." >> "{{ log_file }}"
+      when: current_mac.stdout == (mac_address | lower)
+
+    - name: Exit if MAC address is already set
+      ansible.builtin.meta: end_play
+      when: current_mac.stdout == (mac_address | lower)
+
+    - name: Take interface down
+      ansible.builtin.shell: ip link set "{{ device_name }}" down
+      register: ip_down
+      changed_when: ip_down.rc == 0
+
+    - name: Log taking interface down
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Taking interface {{ device_name }} down" >> "{{ log_file }}"
+
+    - name: Set new MAC address
+      ansible.builtin.shell: ip link set "{{ device_name }}" address "{{ mac_address }}"
+      register: mac_set
+      changed_when: mac_set.rc == 0
+
+    - name: Log setting MAC address
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Setting {{ device_name }} MAC address to {{ mac_address }}" >> "{{ log_file }}"
+
+    - name: Bring interface up
+      ansible.builtin.shell: ip link set "{{ device_name }}" up
+      register: ip_up
+      changed_when: ip_up.rc == 0
+
+    - name: Log bringing interface up
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Bringing interface {{ device_name }} up" >> "{{ log_file }}"
+
+    - name: Connect device using nmcli
+      ansible.builtin.shell: nmcli device connect "{{ device_name }}"
+      register: nmcli_connect
+      changed_when: nmcli_connect.rc == 0
+
+    - name: Log connecting device
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Connecting device {{ device_name }}" >> "{{ log_file }}"
+
+    - name: Get new MAC address
+      ansible.builtin.shell: nmcli device show "{{ device_name }}" | grep -i 'GENERAL.HWADDR' | awk '{print $2}'
+      register: new_mac
+      changed_when: false
+
+    - name: Log new MAC address
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] New MAC address: {{ new_mac.stdout }}" >> "{{ log_file }}"
+
+    - name: Renew DHCP lease
+      ansible.builtin.shell: dhclient -r "{{ device_name }}" && dhclient "{{ device_name }}"
+      register: dhcp_renew
+      changed_when: dhcp_renew.rc == 0
+
+    - name: Log DHCP lease renewal
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Renewing DHCP lease for {{ device_name }}" >> "{{ log_file }}"
+
+    - name: Log successful MAC address change
+      ansible.builtin.shell: echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully changed {{ device_type }} device {{ device_name }} MAC address to: {{ mac_address }}" >> "{{ log_file }}"
